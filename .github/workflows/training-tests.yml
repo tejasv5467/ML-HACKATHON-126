@@ -1,0 +1,28 @@
+name: Training smoke tests
+on:
+  pull_request:
+    paths:
+      - 'pathsnap_real_training.py'
+      - 'pathsnap_real_tune.py'
+      - 'training_cache.py'
+      - 'tests/test_training*.py'
+      - 'requirements.txt'
+      - '.github/workflows/training-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile pathsnap_real_training.py pathsnap_real_tune.py training_cache.py
+      - run: python -m unittest discover -s tests -p 'test_training*.py'
