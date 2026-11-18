@@ -41,6 +41,8 @@ def candidate_features(track, nodes, arcs, k=K):
     """Return candidate features and arc IDs; no reference labels are accepted."""
     if len(arcs) < k:
         raise ValueError('Fewer road segments than requested candidates')
+    if not np.isfinite(track).all() or not np.isfinite(nodes).all():
+        raise ValueError("Non-finite candidate features")
     lon, lat = np.median(track[:, :2], axis=0)
     zone = min(60, max(1, int((lon + 180) // 6) + 1))
     crs = (32600 if lat >= 0 else 32700) + zone
