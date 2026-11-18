@@ -1,5 +1,8 @@
-"""PathSnap five-model training; consumes development feature caches.
-Adapted from the existing PathSnap project; preparation is supplied by the EDA owner.
+"""PathSnap development-only baseline: prepare official trips and compare five models.
+Reference .route files are ordered traversed arcs, not per-fix labels. This baseline
+uses nearest reference segment as a provisional per-fix target; it is NOT verified
+pointwise ground truth and does not enforce reference sequence order.
+Never reads evaluator_test. Features are independent of route labels.
 """
 import argparse
 import json
@@ -8,6 +11,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import shapely
+from shapely.strtree import STRtree
+from pyproj import Transformer
 from sklearn.base import clone
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -24,31 +30,126 @@ K = 5
 SEED = 42
 
 
-# Preparation is intentionally a separate team work package.
-def _preparation_module():
-    try:
-        import pathsnap_real_preprocessing as prep
-    except ModuleNotFoundError as exc:
-        if exc.name != 'pathsnap_real_preprocessing':
-            raise
-        raise RuntimeError('Integrate the EDA member\'s pathsnap_real_preprocessing.py first.') from exc
-    return prep
+def read_table(path, ncols, dtype=float):
+    a = np.loadtxt(path, dtype=dtype, ndmin=2)
+    if a.shape[1] != ncols or not len(a):
+        raise ValueError(f'Unexpected shape {a.shape}: {path}')
+    return a
 
 
-def read_table(*args, **kwargs):
-    return _preparation_module().read_table(*args, **kwargs)
+def candidate_features(track, nodes, arcs, k=K):
+    """Return candidate features and arc IDs; no reference labels are accepted."""
+    if len(arcs) < k:
+        raise ValueError('Fewer road segments than requested candidates')
+    lon, lat = np.median(track[:, :2], axis=0)
+    zone = min(60, max(1, int((lon + 180) // 6) + 1))
+    crs = (32600 if lat >= 0 else 32700) + zone
+    tf = Transformer.from_crs(4326, crs, always_xy=True)
+    gps = np.column_stack(tf.transform(track[:, 0], track[:, 1]))
+    xy = np.column_stack(tf.transform(nodes[:, 0], nodes[:, 1]))
+    ends = xy[arcs]
+    lines = shapely.linestrings(ends)
+    tree = STRtree(lines)
+    points = shapely.points(gps)
+    ids = np.empty((len(track), k), dtype=np.int32)
+    # Find exact nearest k segments in the projected CRS by expanding the radius
+    # only for observations with fewer than k segments inside the current radius.
+    for start in range(0, len(track), 512):
+        pending = np.arange(start, min(start + 512, len(track)))
+        radius = 25.0
+        while len(pending):
+            pair = tree.query(points[pending], predicate='dwithin', distance=radius)
+            if pair.size:
+                q, a = pair
+                dist = shapely.distance(points[pending[q]], lines[a])
+                order = np.lexsort((a, dist, q))
+                q, a = q[order], a[order]
+                count = np.bincount(q, minlength=len(pending))
+                offsets = np.cumsum(count) - count
+                good = np.flatnonzero(count >= k)
+                if len(good):
+                    ids[pending[good]] = a[offsets[good, None] + np.arange(k)]
+                pending = pending[count < k]
+            radius *= 2
+            if radius > 100000 and len(pending):
+                raise ValueError('Candidate search exceeded 100 km; inspect coordinates')
+    vector = ends[:, 1] - ends[:, 0]
+    length = np.hypot(vector[:, 0], vector[:, 1])
+    delta = np.diff(gps, axis=0, prepend=gps[:1])
+    dt = np.diff(track[:, 2], prepend=track[:1, 2])
+    speed = np.divide(np.hypot(delta[:, 0], delta[:, 1]), dt,
+                      out=np.zeros(len(dt)), where=dt > 0)
+    heading = np.degrees(np.arctan2(delta[:, 0], delta[:, 1])) % 360
+    arc_heading = np.degrees(np.arctan2(vector[:, 0], vector[:, 1])) % 360
+    angle = np.abs((heading[:, None] - arc_heading[ids] + 180) % 360 - 180)
+    angle[(dt <= 0) | (speed < 0.5)] = 90.0
+    v = vector[ids]
+    relative = gps[:, None, :] - ends[ids, 0]
+    denom = np.sum(v * v, axis=2)
+    ratio = np.clip(np.divide(np.sum(relative * v, axis=2), denom,
+                     out=np.zeros_like(denom), where=denom > 0), 0, 1)
+    diff = relative - ratio[:, :, None] * v
+    dist = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    x = np.stack([dist, angle, np.broadcast_to(speed[:, None], ids.shape),
+                  length[ids], ratio, np.broadcast_to(dt[:, None], ids.shape),
+                  np.broadcast_to(np.arange(k), ids.shape)], axis=2).astype(np.float32)
+    if not np.isfinite(x).all():
+        raise ValueError('Non-finite candidate features')
+    return x, ids, lines, points
 
 
-def candidate_features(*args, **kwargs):
-    return _preparation_module().candidate_features(*args, **kwargs)
-
-
-def prepare_trip(*args, **kwargs):
-    return _preparation_module().prepare_trip(*args, **kwargs)
+def prepare_trip(folder):
+    stem = folder.name
+    track = read_table(folder / (stem + '.track'), 3)
+    nodes = read_table(folder / (stem + '.nodes'), 2)
+    arcs = read_table(folder / (stem + '.arcs'), 2, int)
+    route = read_table(folder / (stem + '.route'), 1, int).ravel()
+    raw_count = len(track)
+    track = track[np.isfinite(track).all(axis=1) & (np.abs(track[:, 0]) <= 180) & (np.abs(track[:, 1]) <= 90)]
+    track = track[np.argsort(track[:, 2], kind='stable')]
+    if not len(track) or not np.isfinite(nodes).all():
+        raise ValueError(f'Invalid track or network: {folder}')
+    if arcs.min() < 0 or arcs.max() >= len(nodes) or route.min() < 0 or route.max() >= len(arcs):
+        raise ValueError(f'Invalid node or arc index: {folder}')
+    X, ids, lines, points = candidate_features(track, nodes, arcs)
+    # The reference is consulted only after candidate construction.
+    route_ids = np.array(list(dict.fromkeys(route.tolist())), dtype=np.int64)
+    query = STRtree(lines[route_ids]).query_nearest(points, all_matches=True)
+    q, a = query
+    order = np.lexsort((a, q))
+    q, a = q[order], a[order]
+    first = np.r_[True, q[1:] != q[:-1]]
+    ref = np.empty(len(track), dtype=np.int64)
+    ref[q[first]] = route_ids[a[first]]
+    y = (ids == ref[:, None]).astype(np.uint8)
+    inventory = dict(trip_id=stem, raw_gps=raw_count, valid_gps=len(track),
+                     nodes=len(nodes), arcs=len(arcs), reference_sequence_length=len(route),
+                     candidate_miss_rate=float(np.mean(~y.any(axis=1))))
+    return dict(X=X, y=y, ids=ids, from_node=arcs[ids, 0], to_node=arcs[ids, 1], ref=ref), inventory
 
 
 def prepare(root):
-    return _preparation_module().prepare(root)
+    cache = root / 'data' / 'processed'; cache.mkdir(parents=True, exist_ok=True)
+    out = root / 'results' / 'official_baseline'; out.mkdir(parents=True, exist_ok=True)
+    inventory = []
+    seen = set()
+    for split, expected in [('train', 80), ('student_test', 10)]:
+        folders = sorted(p for p in (root / 'data' / split).iterdir() if p.is_dir() and (p / (p.name + '.track')).is_file())
+        if len(folders) != expected:
+            raise ValueError(f'{split}: expected {expected} trips, found {len(folders)}')
+        chunks = []
+        for i, folder in enumerate(folders, 1):
+            if folder.name in seen:
+                raise ValueError('Trip overlap across development partitions')
+            seen.add(folder.name)
+            data, inv = prepare_trip(folder)
+            data['group'] = np.full(len(data['X']), int(folder.name), dtype=np.int32)
+            chunks.append(data)
+            inventory.append(dict(partition=split, **inv))
+            print(f'{split} {i}/{expected}: {folder.name}, {inv["valid_gps"]} fixes, miss={inv["candidate_miss_rate"]:.3f}', flush=True)
+        np.savez_compressed(cache / (split + '.npz'), **{key: np.concatenate([c[key] for c in chunks]) for key in chunks[0]})
+    pd.DataFrame(inventory).to_csv(out / 'dataset_inventory.csv', index=False)
+    print('Feature extraction complete. Targets are nearest-reference proxies, not verified per-fix labels.', flush=True)
 
 
 def models():
