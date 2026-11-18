@@ -1,0 +1,1 @@
+Copy these files into the root of ML-HACKATHON-126, preserving folders. This is a contribution patch, not a replacement repository. Do not copy .git or teammates' training/preprocessing files. See docs/charan_hmm_deployment_verification.md.\n
