@@ -18,6 +18,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, f1_score, log_loss, precision_score, recall_score, confusion_matrix
 import joblib
+from training_cache import validate_development
 
 FEATURES = ['distance_m', 'bearing_difference_deg', 'speed_mps', 'arc_length_m', 'projection_fraction', 'time_gap_s', 'candidate_rank']
 K = 5
@@ -69,10 +70,7 @@ def train(root):
         X, y, group = a['X'], a['y'], a['group']
     with np.load(cache / 'student_test.npz') as a:
         tx, ty, tg, tf, tt, ti = (a[key] for key in ('X', 'y', 'group', 'from_node', 'to_node', 'ids'))
-    if X.shape[1:] != (K, len(FEATURES)) or tx.shape[1:] != (K, len(FEATURES)):
-        raise ValueError('Unexpected feature cache schema')
-    if set(group) & set(tg):
-        raise ValueError('Group leakage')
+    validate_development(X, y, group, tx, ty, tg, ti, tf, tt)
     xf, yf = X.reshape(-1, len(FEATURES)), y.ravel()
     xt, yt = tx.reshape(-1, len(FEATURES)), ty.ravel()
     folds = list(GroupKFold(n_splits=5).split(X, groups=group))

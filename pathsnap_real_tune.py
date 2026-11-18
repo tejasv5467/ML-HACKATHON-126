@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pandas as pd
 import joblib
+from training_cache import validate_development
 import optuna
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import GroupKFold
@@ -28,10 +29,7 @@ def tune(root):
         X, y, g = (a[k] for k in ('X','y','group'))
     with np.load(CACHE / 'student_test.npz') as a:
         tx, ty, tg, ids, fn, tn = (a[k] for k in ('X','y','group','ids','from_node','to_node'))
-    if len(set(g)) != 80 or len(set(tg)) != 10 or set(g) & set(tg):
-        raise ValueError('Expected 80 training and 10 distinct student-test trips')
-    if X.shape[1:] != (K, len(FEATURES)) or tx.shape[1:] != (K, len(FEATURES)):
-        raise ValueError('Unexpected feature cache schema')
+    validate_development(X, y, g, tx, ty, tg, ids, fn, tn)
     folds = list(GroupKFold(n_splits=5).split(X, groups=g))
 
     # No student-test observations enter the search objective.
